@@ -1,9 +1,10 @@
-import argparse
-import sys
-import os
-import time
-import re
+from datetime import datetime
 import json
+import os
+import re
+import sys
+from threading import Thread
+from timeit import default_timer as timer
 
 try: # Python 3.x
     from urllib.parse import quote as urlencode
@@ -19,6 +20,9 @@ except ImportError:  # Python 2.x
 
 from astropy.time import Time
 
+_TELESCOPE = "HST"
+_MAST_SERVER = "masttest.stsci.edu"
+
 #--------------------
 
 def mastQuery(request):
@@ -31,7 +35,7 @@ def mastQuery(request):
         Returns head,content where head is the response HTTP headers, and
         content is the returned data"""
 
-    server='masttest.stsci.edu'
+    server = _MAST_SERVER
 
     # Grab Python Version
     version = ".".join(map(str, sys.version_info[:3]))
@@ -44,6 +48,7 @@ def mastQuery(request):
     # Encoding the request as a json string
     requestString = json.dumps(request)
     requestString = urlencode(requestString)
+    #print(requestString)
 
     # opening the https connection
     conn = httplib.HTTPSConnection(server)
@@ -63,43 +68,61 @@ def mastQuery(request):
 
 #--------------------
 
-def mastDownload(scienceProducts):
-    """ Download files from a previous MAST Products queryself.
+def download_single_file(filerow):
+    """ Download a single file from MAST.
+
+    :param filerow:  One entry from a previous MAST query list of results.
+    :type filerow:  dict
+    """
+
+    server = _MAST_SERVER
+    conn = httplib.HTTPSConnection(server)
+
+    # Make output file path
+    outPath = os.path.join("mastFiles",
+                           filerow['obs_collection'],
+                           filerow['obs_id'],
+                          )
+    if not os.path.exists(outPath):
+        os.makedirs(outPath)
+    outPath = os.path.join(outPath, filerow['productFilename'])
+
+    # Download the data
+    uri = filerow['dataURI']
+    conn.request("GET", "/api/v0/download/file?uri="+uri)
+    resp = conn.getresponse()
+    fileContent = resp.read()
+
+    # Save to file
+    with open(outPath,'wb') as FLE:
+        FLE.write(fileContent)
+
+    # Check that the file saved correctly
+    if not os.path.isfile(outPath):
+        print("ERROR: " + outPath + " failed to download.")
+    else:
+        print("COMPLETE: ", outPath)
+
+    conn.close()
+
+#--------------------
+
+def launch_mast_download(scienceProducts):
+    """ Download files from a previous MAST Products query using Threads.
 
     :param scienceProducts:  A list of data products to be downloaded.
     :type scienceProducts:  list
     """
 
-    # Set up server connection
-    server='masttest.stsci.edu'
-    conn = httplib.HTTPSConnection(server)
+    # Iterate over each row of the scienceProducts list and construct a Thread
+    threads = [Thread(target=download_single_file, args=(row,))
+               for row in scienceProducts]
 
-    # Iterate over each row of the scienceProducts list
-    for row in scienceProducts:
+    # Start all the threads
+    [th.start() for th in threads]
 
-        # Make output file path
-        outPath = "mastFiles/"+row['obs_collection']+'/'+row['obs_id']
-        if not os.path.exists(outPath):
-            os.makedirs(outPath)
-        outPath += '/'+row['productFilename']
-
-        # Download the data
-        uri = row['dataURI']
-        conn.request("GET", "/api/v0/download/file?uri="+uri)
-        resp = conn.getresponse()
-        fileContent = resp.read()
-
-        # Save to file
-        with open(outPath,'wb') as FLE:
-            FLE.write(fileContent)
-
-        # Check that the file saved correctly
-        if not os.path.isfile(outPath):
-            print("ERROR: " + outPath + " failed to download.")
-        else:
-            print("COMPLETE: ", outPath)
-
-    conn.close()
+    # Wait for threads to complete
+    [th.join() for th in threads]
 
 #--------------------
 
@@ -120,6 +143,14 @@ def proposal_id_query(proposal_id, count=True):
     :type count:  boolean
     """
 
+    if proposal_id == "q":
+        quit()
+    try:
+        int(proposal_id)
+    except ValueError:
+        print("Proposal ID's must be numerical!")
+        start_proposal_id_check()
+
     # Determine whether this is a full query or just a count
     if count:
         columns = "COUNT_BIG(*)"    # This will only get a count of the results
@@ -128,7 +159,7 @@ def proposal_id_query(proposal_id, count=True):
 
     # Construct the mashup request
     service = "Mast.Caom.Filtered"
-    filters = [{"paramName":"obs_collection", "values":["HST"]},
+    filters = [{"paramName":"obs_collection", "values":[_TELESCOPE]},
                {"paramName":"proposal_id", "values":[proposal_id]}
               ]
     mashupRequest = {"service":service,
@@ -139,7 +170,7 @@ def proposal_id_query(proposal_id, count=True):
                     }
 
     # Send the query
-    headers,outString = mastQuery(mashupRequest)
+    headers, outString = mastQuery(mashupRequest)
     queryResults = json.loads(outString)
 
     # Return either the full query results or just the results count
@@ -168,9 +199,8 @@ def download_latest_obs(query_dictionary):
     # Find the latest t_min value and the data entry associated with it
     for e in data_entries:
         t = e['t_min']
-        if t is None:
-            continue
-        times.append(t)
+        if t is not None:
+            times.append(t)
 
     # If times is empty, probably hit a planned proposal
     if len(times) == 0:
@@ -187,6 +217,7 @@ def download_latest_obs(query_dictionary):
     print("     LATEST OBSERVATION:")
     print("     obsid: {0}".format(latest_entry['obsid']))
     print("     proposal_id: {0}".format(latest_entry['proposal_id']))
+    print("     PI: {0}".format(latest_entry['proposal_pi']))
     print("     target_name: {0}".format(latest_entry['target_name']))
     mjd = latest_entry['t_min']
     t = Time(mjd, format='mjd')
@@ -210,20 +241,22 @@ def download_latest_obs(query_dictionary):
 
     # Make the download size readable
     download_size = int(download_size / 1000)
-    if len(str(download_size)) < 4:
-        size = "~{0} kB".format(download_size)
-    else:
+    n = 0
+    while len(str(download_size)) > 3:
         download_size = int(download_size / 1000)
-        if len(str(download_size)) < 4:
-            size = "~{0} MB".format(download_size)
-        else:
-            download_size = int(download_size / 1000)
-            if len(str(download_size)) < 4:
-                size = "~{0} GB".format(download_size)
-            else:
-                print("Total file size too large!")
-                quit()
+        n += 1
 
+    if n == 0:
+        bytes = 'kb'
+    elif n == 1:
+        bytes = 'MB'
+    elif n == 2:
+        bytes = 'GB'
+    else:
+        print("Total file size too large!")
+        start_proposal_id_check()
+
+    size = "~{0} {1}".format(download_size, bytes)
     print("Found {0} files associated with {1} ({2} total file size)".format(
                                                                 files_found,
                                                                 obsid,
@@ -231,14 +264,15 @@ def download_latest_obs(query_dictionary):
     dl = input("Download these files? [y/n] ")
 
     # If the user chooses to download, send the data products along to
-    # mastDownload
-    if dl == 'y':
-        mastDownload(obsProducts['data'])
-    else:
-        pass
+    # launch_mast_download
+    if dl.lower() == 'y':
+        start = timer()
+        launch_mast_download(obsProducts['data'])
+        duration = timer() - start
+        print("Downloaded {0} files in {1} sec".format(files_found, duration))
 
     restart = input("Check another Proposal ID? [y/n] ")
-    if restart == "y":
+    if restart.lower() == "y":
         start_proposal_id_check()
     else:
         quit()
@@ -274,7 +308,7 @@ def start_proposal_id_check():
 
     # If prompted, submit the full filtered query and pass that along to
     # download_latest_obs
-    if response == 'y':
+    if response.lower() == 'y':
         query_dictionary = proposal_id_query(propid, count=False)
         download_latest_obs(query_dictionary)
     else:
@@ -284,4 +318,8 @@ def start_proposal_id_check():
 
 if __name__ == "__main__":
 
+    print("(use 'q' to quit)")
+    print("CURRENT SETTINGS:")
+    print("    _TELESCOPE: {0}".format(_TELESCOPE))
+    print("    server: {0}".format(_MAST_SERVER))
     start_proposal_id_check()
