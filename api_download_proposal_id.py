@@ -7,6 +7,10 @@ The primary use case for this is JWST DMS rehearsals, where users wish to
 test API functionality on incoming test data in real time.  The global
 TELESCOPE variable can be set to other telescopes for script testing though.
 
+..usage::  Simply launch the script in a terminal with a 'python
+           api_download_proposal_id.py' command and terminal prompts for user
+           input should guide you through the remaining steps.
+
 ..module::  start_proposal_id_check
 ..synopsis::  Get a proposal ID from user input and execute an initial count
               query.  Launch the following full query and download steps as
@@ -55,7 +59,7 @@ try: # Python 3.x
 except ImportError:  # Python 2.x
     import httplib
 
-_TELESCOPE = "HST"
+_TELESCOPE = "JWST"
 _MAST_SERVER = "masttest.stsci.edu"
 
 #--------------------
@@ -101,25 +105,21 @@ def proposal_id_query(proposal_id, count=True):
     """ Construct a filtered proposal mashup request to send to the mastQuery
     module.  Return either the results of the query or just the results count.
 
-    :param coordinates:  Expects a pair of coordinates in degrees.
-    :type coordinates:  tuple
-
-    :param radius:  Defines the radius to search around the designated
-                    coordinates within.  Also in degrees.
-    :type radius:  float
+    :param proposal_id:  The proposal ID to search for.
+    :type proposal_id:  str
 
     :param count:  Flag to designate whether a full query is submitted, or
                    just the count results.  Also affects the returned
                    product.  Defaults to True.
-    :type count:  boolean
+    :type count:  bool
     """
 
-    if proposal_id == "q":
+    if proposal_id.lower() == "q":
         quit()
     try:
         int(proposal_id)
     except ValueError:
-        print("Proposal ID's must be numerical!")
+        print("Proposal ID must be an integer!")
         start_proposal_id_check()
 
     # Determine whether this is a full query or just a count
@@ -177,7 +177,6 @@ def mastQuery(request):
     # Encoding the request as a json string
     requestString = json.dumps(request)
     requestString = urlencode(requestString)
-    #print(requestString)
 
     # opening the https connection
     conn = httplib.HTTPSConnection(server)
@@ -208,13 +207,9 @@ def download_latest_obs(query_dictionary):
     """
 
     data_entries = query_dictionary['data']
-    times = []
 
     # Find the latest t_min value and the data entry associated with it
-    for e in data_entries:
-        t = e['t_min']
-        if t is not None:
-            times.append(t)
+    times = [float(e['t_min']) for e in data_entries if e['t_min'] is not None]
 
     # If times is empty, probably hit a planned proposal
     if len(times) == 0:
@@ -320,7 +315,9 @@ def launch_mast_download(scienceProducts):
     # Wait for threads to complete
     [th.join() for th in threads]
 
-    numfiles = len([f for f in os.listdir(outdir)])
+    # Get a file count of the target directory and return it for comparison
+    # with the number of requested files.
+    numfiles = len(os.listdir(outdir))
     return numfiles
 
 #--------------------
@@ -353,10 +350,10 @@ def download_single_file(filerow):
         FLE.write(fileContent)
 
     # Check that the file saved correctly
-    if not os.path.isfile(outfile):
-        print("ERROR: " + outfile + " failed to download.")
-    else:
+    if os.path.isfile(outfile):
         print("COMPLETE: ", outfile)
+    else:
+        print("ERROR: " + outfile + " failed to download.")
 
     conn.close()
 
